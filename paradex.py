@@ -7,8 +7,8 @@ Environment variables:
     PARADEX_BASE_ORDER_SIZE_USD (default: 100 when base units not provided)
     PARADEX_PRICE_OFFSET_PCT (default: 0.00015)
     PARADEX_PROFIT_PCT (default: 0.00015, take profit percentage)
-    PARADEX_PRICE_OFFSET_MULTIPLIER (default: 1, geometric multiplier for buy offset per level)
-    PARADEX_SIZE_RATIO (default: 2)
+    PARADEX_PRICE_OFFSET_MULTIPLIER (default: 1.1, geometric multiplier for buy offset per level)
+    PARADEX_SIZE_RATIO (default: 1)
     PARADEX_ORDER_TIMEOUT_SECONDS (default: 30)
     PARADEX_L2_PRIVATE_KEY (or L2_PRIVATE_KEY) required for signing orders
     PARADEX_L2_ADDRESS (or L2_ADDRESS) required for subkey authentication
@@ -53,6 +53,9 @@ class GridConfig:
 
 
 class ParadexGridBot:
+    BUY_COOLDOWN_WINDOW_SECONDS = 90.0
+    BUY_COOLDOWN_STEP_SECONDS = 35.0
+
     def __init__(self, client: ParadexSubkey, config: GridConfig):
         self.client = client
         self.api: ParadexApiClient = client.api_client
@@ -81,6 +84,8 @@ class ParadexGridBot:
 
         self._lock = asyncio.Lock()
         self._processed_fills: set[str] = set()  # Track fill IDs to prevent duplicates
+        self._pending_buy_task: Optional[asyncio.Task] = None
+        self._recent_buy_fill_times: list[float] = []
 
     async def start(self) -> None:
         async with self._lock:
@@ -184,6 +189,7 @@ class ParadexGridBot:
                 if side == "buy" and self._matches_buy(order_id, client_id):
                     await self._handle_buy_fill(price_dec, size_dec)
                 elif side == "sell" and self._matches_sell(order_id, client_id):
+                    LOGGER.info("Processing sell fill_id=%s price=%s size=%s", fill_id, price_dec, size_dec)
                     await self._handle_sell_fill(size_dec)
 
     async def check_stale_orders(self) -> None:
@@ -220,25 +226,58 @@ class ParadexGridBot:
         self.level += 1
         LOGGER.info("Buy filled qty=%s price=%s level=%s pos_qty=%s", qty, price, self.level, self.position_qty)
 
+        cooldown_delay = self._register_buy_cooldown_delay()
+
         # Clear old buy refs before placing new orders
         self._clear_buy_refs()
+        self._cancel_pending_buy_task()
 
         # Only place orders if we have a valid position
         if self.position_qty > 0:
             await self._place_take_profit()
-            await self._place_buy(level=self.level)
+            self._pending_buy_task = asyncio.create_task(
+                self._delayed_place_buy(level=self.level, delay=cooldown_delay)
+            )
+            LOGGER.info(
+                "Scheduled next buy level=%s after %.2fs cooldown", self.level, cooldown_delay
+            )
         else:
             LOGGER.warning("Buy fill resulted in non-positive position qty=%s; resetting", self.position_qty)
             await self._reset_locked()
 
     async def _handle_sell_fill(self, qty: Decimal) -> None:
+        # Calculate the proportional cost to reduce
+        if self.position_qty > 0:
+            avg_price = self.position_cost / self.position_qty
+            cost_reduction = qty * avg_price
+            self.position_cost -= cost_reduction
+            LOGGER.info("Sell filled qty=%s cost_reduction=%s remaining_cost=%s", qty, cost_reduction, self.position_cost)
+
         self.position_qty -= qty
         LOGGER.info("Sell filled qty=%s remaining=%s", qty, self.position_qty)
 
-        # Clear old sell refs
-        self._clear_sell_refs()
+        # Check if position should be cleared:
+        # 1. Position is fully closed (qty <= 0)
+        # 2. OR current price has moved beyond take-profit level (price check)
+        should_clear = self.position_qty <= 0
 
-        if self.position_qty <= 0:
+        # If position still exists, check if price has moved too far beyond TP
+        if not should_clear and self.position_qty > 0:
+            # Calculate TP price
+            avg_price = self.position_cost / self.position_qty if self.position_qty > 0 else Decimal("0")
+            tp_price = avg_price * (Decimal("1") + self.cfg.profit_pct)
+
+            # If current mid price is above TP + buffer, assume fills are done
+            price_buffer = self.cfg.profit_pct * Decimal("0.5")  # 50% of profit margin as buffer
+            if self.mid_price > tp_price * (Decimal("1") + price_buffer):
+                LOGGER.warning(
+                    "Price %s exceeded TP %s by buffer; clearing remaining position %s",
+                    self.mid_price, tp_price, self.position_qty
+                )
+                should_clear = True
+
+        if should_clear:
+            self._clear_sell_refs()
             await self._reset_locked()
 
     async def _reset_locked(self) -> None:
@@ -246,9 +285,11 @@ class ParadexGridBot:
         self.position_qty = Decimal("0")
         self.position_cost = Decimal("0")
         self.level = 0
+        self._cancel_pending_buy_task()
         self._clear_buy_refs()
         self._clear_sell_refs()
         self._processed_fills.clear()  # Clear fill tracking on reset
+        self._recent_buy_fill_times.clear()
         await self._cancel_all()
         await self._place_buy(level=0)
 
@@ -406,6 +447,42 @@ class ParadexGridBot:
             await asyncio.to_thread(self.api.cancel_order, order_id)
         except Exception as exc:  # pragma: no cover - network error handling
             LOGGER.warning("Failed to cancel order %s: %s", order_id, exc)
+
+    def _register_buy_cooldown_delay(self) -> float:
+        now = time.time()
+        window = self.BUY_COOLDOWN_WINDOW_SECONDS
+        self._recent_buy_fill_times = [ts for ts in self._recent_buy_fill_times if now - ts < window]
+        self._recent_buy_fill_times.append(now)
+        delay = self.BUY_COOLDOWN_STEP_SECONDS * len(self._recent_buy_fill_times)
+        return delay
+
+    def _cancel_pending_buy_task(self) -> None:
+        task = self._pending_buy_task
+        if task and not task.done():
+            task.cancel()
+        self._pending_buy_task = None
+
+    async def _delayed_place_buy(self, level: int, delay: float) -> None:
+        current_task = asyncio.current_task()
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            async with self._lock:
+                if self.buy_order_id:
+                    LOGGER.debug(
+                        "Skipping delayed buy placement; active buy order %s exists", self.buy_order_id
+                    )
+                    return
+                target_level = self.level
+                await self._place_buy(level=target_level)
+        except asyncio.CancelledError:
+            LOGGER.debug("Delayed buy placement cancelled for level %s", level)
+            raise
+        except Exception as exc:
+            LOGGER.exception("Error placing delayed buy order at level %s: %s", level, exc)
+        finally:
+            if current_task and self._pending_buy_task is current_task:
+                self._pending_buy_task = None
 
     def _extract_order_id(self, response: Any) -> Optional[str]:
         if isinstance(response, dict):
