@@ -1084,7 +1084,7 @@ wheels = [
 [[package]]
 name = "lighter-sdk"
 version = "0.1.4"
-source = { git = "https://github.com/elliottech/lighter-python.git#7b7c2968fef29c93a21706f9d88f7e9f7232f920" }
+source = { git = "https://github.com/specialjp/lighter-python.git#a23e4d4a3c5005234e5b1a332f4356771feecc35" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiohttp-retry" },
@@ -1332,7 +1332,7 @@ requires-dist = [
     { name = "avantis-trader-sdk", specifier = ">=0.2.1" },
     { name = "grvt-pysdk", specifier = ">=0.1.19" },
     { name = "hyperliquid-python-sdk", specifier = ">=0.19.0" },
-    { name = "lighter-sdk", git = "https://github.com/elliottech/lighter-python.git" },
+    { name = "lighter-sdk", git = "https://github.com/specialjp/lighter-python.git" },
     { name = "paradex-py", specifier = "==0.5.0rc2" },
     { name = "pybit", specifier = ">=5.6.0" },
     { name = "python-dotenv", specifier = ">=1.1.1" },

@@ -76,6 +76,8 @@ class ParadexGridBot:
         self.sell_client_id: Optional[str] = None
         self.buy_order_ts: Optional[float] = None
         self.sell_order_ts: Optional[float] = None
+        self.buy_order_size = Decimal("0")
+        self.buy_order_filled = Decimal("0")
 
         self.size_increment = Decimal("0")
         self.price_increment = Decimal("0")
@@ -187,7 +189,7 @@ class ParadexGridBot:
                         self._processed_fills = set(list(self._processed_fills)[-500:])
 
                 if side == "buy" and self._matches_buy(order_id, client_id):
-                    await self._handle_buy_fill(price_dec, size_dec)
+                    await self._handle_buy_fill(order_id, price_dec, size_dec)
                 elif side == "sell" and self._matches_sell(order_id, client_id):
                     LOGGER.info("Processing sell fill_id=%s price=%s size=%s", fill_id, price_dec, size_dec)
                     await self._handle_sell_fill(size_dec)
@@ -220,30 +222,53 @@ class ParadexGridBot:
                 LOGGER.info("Buy order %s stale at level %s; keeping order active (position already open)",
                            self.buy_order_id, self.level)
 
-    async def _handle_buy_fill(self, price: Decimal, qty: Decimal) -> None:
+    async def _handle_buy_fill(self, order_id: Optional[str], price: Decimal, qty: Decimal) -> None:
         self.position_qty += qty
         self.position_cost += qty * price
-        self.level += 1
-        LOGGER.info("Buy filled qty=%s price=%s level=%s pos_qty=%s", qty, price, self.level, self.position_qty)
+        remaining_for_order: Optional[Decimal] = None
+        is_primary_order = bool(self.buy_order_id and order_id and order_id == self.buy_order_id)
 
-        cooldown_delay = self._register_buy_cooldown_delay()
+        if is_primary_order:
+            self.buy_order_filled += qty
+            remaining_for_order = self.buy_order_size - self.buy_order_filled
+            if remaining_for_order < 0:
+                remaining_for_order = Decimal("0")
 
-        # Clear old buy refs before placing new orders
-        self._clear_buy_refs()
-        self._cancel_pending_buy_task()
+        LOGGER.info(
+            "Buy filled qty=%s price=%s pos_qty=%s order_remaining=%s",
+            qty,
+            price,
+            self.position_qty,
+            remaining_for_order if remaining_for_order is not None else "n/a",
+        )
 
-        # Only place orders if we have a valid position
         if self.position_qty > 0:
             await self._place_take_profit()
-            self._pending_buy_task = asyncio.create_task(
-                self._delayed_place_buy(level=self.level, delay=cooldown_delay)
-            )
-            LOGGER.info(
-                "Scheduled next buy level=%s after %.2fs cooldown", self.level, cooldown_delay
-            )
         else:
             LOGGER.warning("Buy fill resulted in non-positive position qty=%s; resetting", self.position_qty)
             await self._reset_locked()
+            return
+
+        order_complete = False
+        if is_primary_order:
+            tolerance = self.size_increment if self.size_increment > 0 else Decimal("1e-12")
+            remaining_for_order = remaining_for_order or Decimal("0")
+            order_complete = remaining_for_order <= tolerance / Decimal("2")
+
+        if not order_complete:
+            return
+
+        self.level += 1
+        cooldown_delay = self._register_buy_cooldown_delay()
+        self._clear_buy_refs()
+        self._cancel_pending_buy_task()
+
+        self._pending_buy_task = asyncio.create_task(
+            self._delayed_place_buy(level=self.level, delay=cooldown_delay)
+        )
+        LOGGER.info(
+            "Scheduled next buy level=%s after %.2fs cooldown", self.level, cooldown_delay
+        )
 
     async def _handle_sell_fill(self, qty: Decimal) -> None:
         # Calculate the proportional cost to reduce
@@ -336,6 +361,8 @@ class ParadexGridBot:
         self.buy_order_id = order_id
         self.buy_client_id = client_id
         self.buy_order_ts = time.time()
+        self.buy_order_size = quantity
+        self.buy_order_filled = Decimal("0")
         order_notional = quantity * target_price
         LOGGER.info(
             "Placed buy level=%s price=%s qty=%s notional_usd=%s offset_pct=%s id=%s",
@@ -571,6 +598,8 @@ class ParadexGridBot:
         self.buy_order_id = None
         self.buy_client_id = None
         self.buy_order_ts = None
+        self.buy_order_size = Decimal("0")
+        self.buy_order_filled = Decimal("0")
 
     def _clear_sell_refs(self) -> None:
         self.sell_order_id = None
