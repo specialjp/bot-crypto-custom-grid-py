@@ -68,6 +68,7 @@ class ParadexGridBot:
         self.mid_price = Decimal("0")
         self.position_qty = Decimal("0")
         self.position_cost = Decimal("0")
+        self.last_buy_fill_price: Optional[Decimal] = None
         self.level = 0
 
         self.buy_order_id: Optional[str] = None
@@ -225,6 +226,7 @@ class ParadexGridBot:
     async def _handle_buy_fill(self, order_id: Optional[str], price: Decimal, qty: Decimal) -> None:
         self.position_qty += qty
         self.position_cost += qty * price
+        self.last_buy_fill_price = price
         remaining_for_order: Optional[Decimal] = None
         is_primary_order = bool(self.buy_order_id and order_id and order_id == self.buy_order_id)
 
@@ -309,6 +311,7 @@ class ParadexGridBot:
         LOGGER.info("Resetting cycle")
         self.position_qty = Decimal("0")
         self.position_cost = Decimal("0")
+        self.last_buy_fill_price = None
         self.level = 0
         self._cancel_pending_buy_task()
         self._clear_buy_refs()
@@ -330,6 +333,19 @@ class ParadexGridBot:
             )
         target_price = self.mid_price * (Decimal("1") - adjusted_offset_pct)
         target_price = self._quantize_price(target_price, OrderSide.Buy)
+
+        # Ensure new buy order is always below last buy fill price
+        if self.last_buy_fill_price is not None and level > 0:
+            if target_price >= self.last_buy_fill_price:
+                # Adjust target price to be below last fill using adjusted_offset_pct
+                target_price = self.last_buy_fill_price * (Decimal("1") - adjusted_offset_pct)
+                target_price = self._quantize_price(target_price, OrderSide.Buy)
+                LOGGER.info(
+                    "Adjusted buy price from calculated to %s (below last fill %s with offset %.4f%%)",
+                    target_price,
+                    self.last_buy_fill_price,
+                    adjusted_offset_pct * 100
+                )
 
         base_qty = None
         if self.cfg.base_order_size is not None and self.cfg.base_order_size > Decimal("0"):

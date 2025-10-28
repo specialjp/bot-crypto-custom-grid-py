@@ -92,6 +92,7 @@ class LighterGridBot:
         self.mid_price = Decimal("0")
         self.position_qty = Decimal("0")
         self.position_cost = Decimal("0")
+        self.last_buy_fill_price: Optional[Decimal] = None
         self.level = 0
 
         self.buy_order_index: Optional[int] = None
@@ -354,6 +355,7 @@ class LighterGridBot:
     async def _handle_buy_fill(self, price: Decimal, qty: Decimal) -> None:
         self.position_qty += qty
         self.position_cost += qty * price
+        self.last_buy_fill_price = price
         self.level += 1
         LOGGER.info("Buy filled qty=%s price=%s level=%s", qty, price, self.level)
         cooldown_delay = self._register_buy_cooldown_delay()
@@ -384,6 +386,7 @@ class LighterGridBot:
         LOGGER.info("Resetting cycle")
         self.position_qty = Decimal("0")
         self.position_cost = Decimal("0")
+        self.last_buy_fill_price = None
         self.level = 0
         self._cancel_pending_buy_task()
         self._clear_buy_refs()
@@ -407,6 +410,19 @@ class LighterGridBot:
             )
         target_price = self.mid_price * (Decimal("1") - adjusted_offset_pct)
         target_price = self._quantize_price(target_price, is_ask=False)
+
+        # Ensure new buy order is always below last buy fill price
+        if self.last_buy_fill_price is not None and level > 0:
+            if target_price >= self.last_buy_fill_price:
+                # Adjust target price to be below last fill using adjusted_offset_pct
+                target_price = self.last_buy_fill_price * (Decimal("1") - adjusted_offset_pct)
+                target_price = self._quantize_price(target_price, is_ask=False)
+                LOGGER.info(
+                    "Adjusted buy price from calculated to %s (below last fill %s with offset %.4f%%)",
+                    target_price,
+                    self.last_buy_fill_price,
+                    adjusted_offset_pct * 100
+                )
 
         base_qty = self._compute_base_size(level, target_price)
         quantity = self._quantize_size(base_qty)
