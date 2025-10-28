@@ -226,12 +226,12 @@ class LighterGridBot:
 
                     if is_buy and order_idx == self.buy_order_index:
                         LOGGER.info("Buy order canceled with status=%s; restarting from level %s", status, self.level)
-                        self._clear_buy_refs()
-                        self._cancel_pending_buy_task()
+                        # self._clear_buy_refs()
+                        # self._cancel_pending_buy_task()
                         # await self._place_buy(level=self.level)
                     elif is_sell and order_idx == self.sell_order_index:
                         LOGGER.info("Take-profit canceled with status=%s; re-placing if position remains", status)
-                        self._clear_sell_refs()
+                        # self._clear_sell_refs()
                         if self.position_qty > 0:
                             print('place tp')
                             # await self._place_take_profit()
