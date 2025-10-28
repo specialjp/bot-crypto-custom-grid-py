@@ -134,6 +134,8 @@ class LighterGridBot:
             return
         bids = state.get("bids") or []
         asks = state.get("asks") or []
+        print('asks',asks)
+
         if not bids or not asks:
             return
         bid_raw = bids[0].get("price")
