@@ -125,9 +125,9 @@ class LighterGridBot:
                 self.market_id,
                 self.mid_price,
             )
-            await self._cancel_all()
-            self._cancel_pending_buy_task()
-            await self._place_buy(level=0)
+            # await self._cancel_all()
+            # self._cancel_pending_buy_task()
+            # await self._place_buy(level=0)
 
     async def on_order_book_update(self, market_id: Any, state: dict[str, Any]) -> None:
         if not self._matches_market(market_id):
@@ -174,9 +174,9 @@ class LighterGridBot:
             return
 
         # Extract and process orders directly using is_ask and status fields
-        orders = list(self._extract_orders(payload))
-        if orders:
-            await self._process_orders(orders)
+        # orders = list(self._extract_orders(payload))
+        # if orders:
+        #     await self._process_orders(orders)
 
     async def check_stale_orders(self) -> None:
         now = time.time()
@@ -192,7 +192,7 @@ class LighterGridBot:
                     self.buy_client_index,
                 )
                 # await self._cancel_all()
-                await self._reset_locked()
+                # await self._reset_locked()
                 return
             if (
                 self.buy_client_index is not None
@@ -228,12 +228,13 @@ class LighterGridBot:
                         LOGGER.info("Buy order canceled with status=%s; restarting from level %s", status, self.level)
                         self._clear_buy_refs()
                         self._cancel_pending_buy_task()
-                        await self._place_buy(level=self.level)
+                        # await self._place_buy(level=self.level)
                     elif is_sell and order_idx == self.sell_order_index:
                         LOGGER.info("Take-profit canceled with status=%s; re-placing if position remains", status)
                         self._clear_sell_refs()
                         if self.position_qty > 0:
-                            await self._place_take_profit()
+                            print('place tp')
+                            # await self._place_take_profit()
                     continue  # Skip further processing for canceled orders
 
                 # Determine if this is our BUY or SELL order
@@ -360,13 +361,13 @@ class LighterGridBot:
         LOGGER.info("Buy filled qty=%s price=%s level=%s", qty, price, self.level)
         cooldown_delay = self._register_buy_cooldown_delay()
 
-        self._clear_buy_refs()
-        self._cancel_pending_buy_task()
+        # self._clear_buy_refs()
+        # self._cancel_pending_buy_task()
 
-        await self._place_take_profit()
-        self._pending_buy_task = asyncio.create_task(
-            self._delayed_place_buy(level=self.level, delay=cooldown_delay)
-        )
+        # await self._place_take_profit()
+        # self._pending_buy_task = asyncio.create_task(
+        #     self._delayed_place_buy(level=self.level, delay=cooldown_delay)
+        # )
         LOGGER.info(
             "Scheduled next buy level=%s after %.2fs cooldown",
             self.level,
@@ -374,13 +375,13 @@ class LighterGridBot:
         )
 
     async def _handle_sell_fill(self, qty: Decimal) -> None:
-        self.position_qty -= qty
+        # self.position_qty -= qty
         LOGGER.info("Sell filled qty=%s remaining=%s", qty, self.position_qty)
-        self._clear_sell_refs()
-        if self.position_qty <= 0:
-            await self._reset_locked()
-        else:
-            await self._place_take_profit()
+        # self._clear_sell_refs()
+        # if self.position_qty <= 0:
+        #     await self._reset_locked()
+        # else:
+        #     await self._place_take_profit()
 
     async def _reset_locked(self) -> None:
         LOGGER.info("Resetting cycle")
@@ -388,12 +389,12 @@ class LighterGridBot:
         self.position_cost = Decimal("0")
         self.last_buy_fill_price = None
         self.level = 0
-        self._cancel_pending_buy_task()
-        self._clear_buy_refs()
-        self._clear_sell_refs()
-        self._recent_buy_fill_times.clear()
-        await self._cancel_all()
-        await self._place_buy(level=0)
+        # self._cancel_pending_buy_task()
+        # self._clear_buy_refs()
+        # self._clear_sell_refs()
+        # self._recent_buy_fill_times.clear()
+        # await self._cancel_all()
+        # await self._place_buy(level=0)
 
     async def _place_buy(self, level: int) -> None:
         if self.market_id is None:
