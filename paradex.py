@@ -701,6 +701,8 @@ async def main() -> None:
     await bot.start()
 
     ws_client = client.ws_client
+    # Disable read timeouts to avoid concurrent recv attempts inside websockets library.
+    ws_client.ws_timeout = None
     await ws_client.connect()
     await asyncio.sleep(1)
     await _subscribe_streams(ws_client, bot, market)
