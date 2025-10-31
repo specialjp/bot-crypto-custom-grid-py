@@ -13,6 +13,8 @@ Environment variables:
     HYPERLIQUID_PROFIT_PCT (default: 0.0002)
     HYPERLIQUID_SIZE_RATIO (default: 2)
     HYPERLIQUID_ORDER_TIMEOUT_SECONDS (default: 30)
+    HYPERLIQUID_STOP_LOSS_PCT (optional decimal, e.g. 0.05 for 5% ROE loss)
+    HYPERLIQUID_STOP_LOSS_COOLDOWN_MINUTES (default: 5, minutes to pause after stop loss)
 
 Orders are signed locally via eth-account and submitted through the Exchange REST API.
 Websocket subscriptions stream best bid/offer updates and private fills for reactive trading.
@@ -26,7 +28,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, DivisionByZero, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Any, Optional, Sequence
 
 from dotenv import load_dotenv
@@ -52,6 +54,19 @@ class GridConfig:
     profit_pct: Decimal = Decimal("0.0002")
     size_ratio: Decimal = Decimal("1")
     order_timeout_seconds: float = 10.0
+    stop_loss_pct: Optional[Decimal] = None
+    stop_loss_cooldown_minutes: float = 5.0
+
+
+@dataclass(slots=True)
+class PositionSnapshot:
+    qty: Optional[Decimal]
+    avg_px: Optional[Decimal]
+    margin_used: Optional[Decimal]
+    position_value: Optional[Decimal]
+    leverage: Optional[Decimal]
+    return_on_equity: Optional[Decimal]
+    unrealized_pnl: Optional[Decimal]
 
 
 class HyperliquidGridBot:
@@ -91,6 +106,14 @@ class HyperliquidGridBot:
         self._pending_buy_task: Optional[asyncio.Task] = None
         self._recent_buy_fill_times: list[float] = []
         self._open_order_cache: list[dict[str, Any]] = []
+        self.margin_used: Optional[Decimal] = None
+        self.current_leverage: Optional[Decimal] = None
+        self.current_return_on_equity: Optional[Decimal] = None
+        self.stop_loss_price: Optional[Decimal] = None
+        self.stop_cloid: Optional[Cloid] = None
+        self.stop_oid: Optional[int] = None
+        self.stop_order_ts: Optional[float] = None
+        self.last_stop_loss_time: Optional[float] = None
 
     async def start(self) -> None:
         async with self._lock:
@@ -113,6 +136,7 @@ class HyperliquidGridBot:
             else:
                 # Has position: ensure take profit is placed
                 await self._place_take_profit()
+                await self._place_stop_loss_order()
                 # Place next buy order at current level
                 if self.buy_oid is None and self.buy_cloid is None:
                     await self._place_buy(level=self.level)
@@ -182,17 +206,71 @@ class HyperliquidGridBot:
                         self.buy_oid = oid
                     await self._handle_buy_fill(price, size)
                 else:
+                    is_stop_fill = False
+                    avg_price_before_fill: Optional[Decimal] = None
+                    if self.position_qty > 0:
+                        try:
+                            avg_price_before_fill = self.position_cost / self.position_qty
+                        except (InvalidOperation, DivisionByZero):
+                            avg_price_before_fill = None
+                    if oid is not None and self.stop_oid is not None and oid == self.stop_oid:
+                        is_stop_fill = True
+                    elif oid is not None and self.sell_oid is not None and oid == self.sell_oid:
+                        is_stop_fill = False
+                    elif (
+                        price is not None
+                        and avg_price_before_fill is not None
+                        and price <= avg_price_before_fill
+                    ):
+                        is_stop_fill = True
                     if oid is not None:
-                        self.sell_oid = oid
-                    await self._handle_sell_fill(size)
+                        if is_stop_fill:
+                            self.stop_oid = oid
+                        else:
+                            self.sell_oid = oid
+                    await self._handle_sell_fill(size, price, is_stop_fill)
 
     async def on_candle(self, _message: dict[str, Any]) -> None:
         """Placeholder for candle data callback. Not currently used."""
         pass
 
+    def is_in_stop_loss_cooldown(self) -> bool:
+        """Check if bot is currently in stop-loss cooldown period."""
+        if self.last_stop_loss_time is None:
+            return False
+        cooldown_seconds = self.cfg.stop_loss_cooldown_minutes * 60
+        elapsed = time.time() - self.last_stop_loss_time
+        return elapsed < cooldown_seconds
+
+    def get_remaining_cooldown_seconds(self) -> float:
+        """Get remaining cooldown time in seconds, or 0 if not in cooldown."""
+        if not self.is_in_stop_loss_cooldown():
+            return 0.0
+        cooldown_seconds = self.cfg.stop_loss_cooldown_minutes * 60
+        elapsed = time.time() - self.last_stop_loss_time
+        return max(0.0, cooldown_seconds - elapsed)
+
     async def check_stale_orders(self) -> None:
         now = time.time()
         async with self._lock:
+            # Check if cooldown period has ended and we need to resume trading
+            if (
+                self.last_stop_loss_time is not None
+                and self.level == 0
+                and self.position_qty == 0
+                and self.buy_oid is None
+                and self.buy_cloid is None
+            ):
+                if self.is_in_stop_loss_cooldown():
+                    # Still in cooldown, do nothing
+                    pass
+                else:
+                    # Cooldown ended, resume trading
+                    LOGGER.info("Stop-loss cooldown period ended. Resuming trading...")
+                    self.last_stop_loss_time = None
+                    await self._place_buy(level=0)
+                    return
+
             if (
                 self.buy_order_ts
                 and now - self.buy_order_ts > self.cfg.order_timeout_seconds
@@ -216,8 +294,13 @@ class HyperliquidGridBot:
                 and now - self.sell_order_ts > self.cfg.order_timeout_seconds
             ):
                 LOGGER.info("Take-profit order stale; attempting re-place")
-                self._clear_sell_refs()
                 await self._place_take_profit()
+            if (
+                self.stop_order_ts
+                and now - self.stop_order_ts > self.cfg.order_timeout_seconds
+            ):
+                LOGGER.info("Stop-loss order stale; attempting re-place")
+                await self._place_stop_loss_order()
 
     async def _handle_buy_fill(self, price: Decimal, qty: Decimal) -> None:
         self.position_qty += qty
@@ -239,11 +322,41 @@ class HyperliquidGridBot:
 
         # Cancel old take-profit order before placing new one with updated qty and avg price
         await self._cancel_take_profit()
-        await self._place_take_profit()
+
+        # Place TP with retry logic
+        tp_placed = False
+        for attempt in range(3):
+            try:
+                await self._place_take_profit()
+                tp_placed = True
+                break
+            except Exception as exc:
+                LOGGER.warning("TP placement attempt %s/3 failed: %s", attempt + 1, exc)
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+
+        if not tp_placed:
+            LOGGER.error("Failed to place take-profit after 3 attempts!")
+
         if self.position_qty <= 0:
             LOGGER.warning("Position qty non-positive after buy fill; resetting")
             await self._reset_locked()
             return
+
+        # Refresh stop loss state with retry
+        stop_placed = False
+        for attempt in range(3):
+            try:
+                await self._refresh_stop_loss_state()
+                stop_placed = True
+                break
+            except Exception as exc:
+                LOGGER.warning("Stop loss refresh attempt %s/3 failed: %s", attempt + 1, exc)
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+
+        if not stop_placed:
+            LOGGER.error("Failed to refresh stop-loss after 3 attempts!")
 
         self._pending_buy_task = asyncio.create_task(
             self._delayed_place_buy(level=self.level, delay=delay)
@@ -254,13 +367,37 @@ class HyperliquidGridBot:
             delay,
         )
 
-    async def _handle_sell_fill(self, qty: Decimal) -> None:
+    async def _handle_sell_fill(
+        self,
+        qty: Decimal,
+        price: Optional[Decimal],
+        is_stop_fill: bool,
+    ) -> None:
         self.position_qty -= qty
-        LOGGER.info("Sell filled qty=%s remaining=%s", qty, self.position_qty)
+        LOGGER.info(
+            "%s fill qty=%s price=%s remaining=%s",
+            "Stop-loss" if is_stop_fill else "Take-profit",
+            qty,
+            price,
+            self.position_qty,
+        )
         self._clear_sell_refs()
         if self.position_qty <= 0:
+            self.margin_used = None
+            self.current_leverage = None
+            self.current_return_on_equity = None
+            self.stop_loss_price = None
+            # Record stop loss time if this was a stop loss fill
+            if is_stop_fill:
+                self.last_stop_loss_time = time.time()
+                cooldown_minutes = self.cfg.stop_loss_cooldown_minutes
+                LOGGER.warning(
+                    "Stop-loss triggered! Bot will pause for %.1f minutes before resuming.",
+                    cooldown_minutes,
+                )
             await self._reset_locked()
         else:
+            await self._refresh_stop_loss_state()
             await self._place_take_profit()
 
     async def _reset_locked(self) -> None:
@@ -269,12 +406,28 @@ class HyperliquidGridBot:
         self.position_cost = Decimal("0")
         self.last_buy_fill_price = None
         self.level = 0
+        self.margin_used = None
+        self.current_leverage = None
+        self.current_return_on_equity = None
+        self.stop_loss_price = None
         self._cancel_pending_buy_task()
         self._clear_buy_refs()
         self._clear_sell_refs()
         self._processed_fills.clear()
         self._recent_buy_fill_times.clear()
         await self._cancel_all()
+
+        # Check if in stop-loss cooldown period
+        if self.is_in_stop_loss_cooldown():
+            remaining = self.get_remaining_cooldown_seconds()
+            LOGGER.info(
+                "Stop-loss cooldown active. Bot will resume trading in %.1f seconds (%.1f minutes).",
+                remaining,
+                remaining / 60,
+            )
+            # Do not place buy order yet - will be handled by check_stale_orders
+            return
+
         await self._place_buy(level=0)
 
     async def _ensure_no_active_buy(self) -> bool:
@@ -355,7 +508,7 @@ class HyperliquidGridBot:
     async def _place_take_profit(self) -> None:
         if not self.market_coin or self.position_qty <= 0:
             return
-        if await self._has_active_sell_order():
+        if await self._has_active_take_profit_order():
             LOGGER.debug("Active take-profit order exists; skipping placement.")
             return
         avg_price = self.position_cost / self.position_qty if self.position_qty > 0 else Decimal("0")
@@ -451,8 +604,180 @@ class HyperliquidGridBot:
                 await asyncio.to_thread(self.exchange.cancel_by_cloid, self.market_coin, self.sell_cloid)
             except Exception as exc:
                 LOGGER.warning("Failed to cancel sell cloid=%s: %s", self.sell_cloid.to_raw(), exc)
-        self._clear_sell_refs()
-        await self._wait_for_orders_cleared({"A"})
+        self._clear_take_profit_refs()
+        await self._refresh_open_order_refs()
+
+    async def _cancel_stop_loss_order(self) -> None:
+        if not self.market_coin:
+            self._clear_stop_refs()
+            return
+        cancelled_any = False
+        if self.stop_oid is not None:
+            try:
+                await asyncio.to_thread(self.exchange.cancel, self.market_coin, self.stop_oid)
+                cancelled_any = True
+            except Exception as exc:
+                LOGGER.warning("Failed to cancel stop-loss oid=%s: %s", self.stop_oid, exc)
+        elif self.stop_cloid is not None:
+            try:
+                await asyncio.to_thread(self.exchange.cancel_by_cloid, self.market_coin, self.stop_cloid)
+                cancelled_any = True
+            except Exception as exc:
+                LOGGER.warning("Failed to cancel stop-loss cloid=%s: %s", self.stop_cloid.to_raw(), exc)
+        else:
+            orders = await self._fetch_open_orders()
+            avg_price = None
+            if self.position_qty > 0:
+                try:
+                    avg_price = self.position_cost / self.position_qty
+                except (InvalidOperation, DivisionByZero):
+                    avg_price = None
+            if avg_price is not None:
+                for order in orders:
+                    side = str(order.get("side") or "").upper()
+                    if side != "A":
+                        continue
+                    order_price = self._safe_decimal(order.get("limitPx") or order.get("px"))
+                    if order_price is None or order_price >= avg_price:
+                        continue
+                    oid = self._safe_int(order.get("oid"))
+                    if oid is None:
+                        continue
+                    try:
+                        await asyncio.to_thread(self.exchange.cancel, self.market_coin, oid)
+                        cancelled_any = True
+                    except Exception as exc:
+                        LOGGER.debug("Failed to cancel inferred stop-loss oid=%s: %s", oid, exc)
+        self._clear_stop_refs()
+        if cancelled_any:
+            await self._refresh_open_order_refs()
+
+    async def _place_stop_loss_order(self) -> None:
+        pct = self.cfg.stop_loss_pct
+        if pct is None or pct <= 0:
+            await self._cancel_stop_loss_order()
+            return
+        if not self.market_coin or self.position_qty <= 0:
+            await self._cancel_stop_loss_order()
+            return
+        self._recompute_stop_loss_price()
+        price = self.stop_loss_price
+        if price is None or price <= 0:
+            LOGGER.debug("Stop-loss price unavailable; cancelling existing stop order.")
+            await self._cancel_stop_loss_order()
+            return
+        quantity = self._quantize_size(self.position_qty, round_up=True)
+        if quantity <= 0:
+            await self._cancel_stop_loss_order()
+            return
+
+        await self._refresh_open_order_refs()
+
+        existing_order: Optional[dict[str, Any]] = None
+        for order in self._open_order_cache:
+            side = str(order.get("side") or "").upper()
+            if side != "A":
+                continue
+            oid = self._safe_int(order.get("oid"))
+            cloid_raw = order.get("cloid")
+            if self.stop_oid is not None and oid == self.stop_oid:
+                existing_order = order
+                break
+            if (
+                self.stop_cloid is not None
+                and isinstance(cloid_raw, str)
+                and cloid_raw.lower() == self.stop_cloid.to_raw().lower()
+            ):
+                existing_order = order
+                break
+
+        existing_price: Optional[Decimal] = None
+        existing_qty: Optional[Decimal] = None
+        if existing_order is not None:
+            existing_price = self._safe_decimal(
+                existing_order.get("limitPx") or existing_order.get("px")
+            )
+            existing_qty = self._safe_decimal(
+                existing_order.get("origSz") or existing_order.get("sz")
+            )
+
+        price_matches = (
+            existing_price is not None
+            and (existing_price - price).copy_abs() <= (self.price_increment or Decimal("0.00000001"))
+        )
+        qty_matches = (
+            existing_qty is not None
+            and self._approximately_equal(existing_qty, quantity)
+        )
+        if existing_order is not None and price_matches and qty_matches:
+            self.stop_order_ts = time.time()
+            return
+
+        if existing_order is not None:
+            await self._cancel_stop_loss_order()
+
+        avg_entry = None
+        if self.position_qty > 0:
+            try:
+                avg_entry = self.position_cost / self.position_qty
+            except (InvalidOperation, DivisionByZero):
+                avg_entry = None
+
+        # Cancel any stale stop-like sell orders that might linger (price below entry)
+        stale_candidates: list[int] = []
+        for order in self._open_order_cache:
+            side = str(order.get("side") or "").upper()
+            if side != "A":
+                continue
+            oid = self._safe_int(order.get("oid"))
+            if oid is None:
+                continue
+            if existing_order is not None and order is existing_order:
+                continue
+            order_price = self._safe_decimal(order.get("limitPx") or order.get("px"))
+            if (
+                avg_entry is not None
+                and order_price is not None
+                and order_price < avg_entry
+            ):
+                stale_candidates.append(oid)
+
+        for oid in stale_candidates:
+            try:
+                await asyncio.to_thread(self.exchange.cancel, self.market_coin, oid)
+            except Exception as exc:
+                LOGGER.debug("Failed to cancel stale stop-like order oid=%s: %s", oid, exc)
+
+        if stale_candidates:
+            await self._refresh_open_order_refs()
+
+        cloid = Cloid("0x" + secrets.token_hex(16))
+        order_type = {"limit": {"tif": "Gtc"}}
+        try:
+            await asyncio.to_thread(
+                self.exchange.order,
+                self.market_coin,
+                False,
+                float(quantity),
+                float(price),
+                order_type,
+                True,
+                cloid,
+            )
+        except Exception as exc:
+            LOGGER.error("Failed to place stop-loss order: %s", exc)
+            await self._refresh_open_order_refs()
+            return
+
+        self.stop_cloid = cloid
+        self.stop_oid = None
+        self.stop_order_ts = time.time()
+        LOGGER.info(
+            "Placed stop-loss price=%s qty=%s cloid=%s",
+            price,
+            quantity,
+            cloid.to_raw(),
+        )
         await self._refresh_open_order_refs()
 
     async def _delayed_place_buy(self, level: int, delay: float) -> None:
@@ -482,9 +807,19 @@ class HyperliquidGridBot:
     async def _refresh_open_order_refs(self) -> list[dict[str, Any]]:
         orders = await self._fetch_open_orders()
         buy_oid = None
-        sell_oid = None
+        take_profit_oid = None
+        stop_oid = None
         buy_cloid = None
-        sell_cloid = None
+        take_profit_cloid = None
+        stop_cloid = None
+
+        avg_price = None
+        if self.position_qty > 0:
+            try:
+                avg_price = self.position_cost / self.position_qty
+            except (InvalidOperation, DivisionByZero):
+                avg_price = None
+
         for order in orders:
             side = str(order.get("side") or "").upper()
             oid = self._safe_int(order.get("oid"))
@@ -494,19 +829,56 @@ class HyperliquidGridBot:
                 if isinstance(cloid_raw, str) and cloid_raw:
                     buy_cloid = Cloid(cloid_raw)
             elif side == "A":
-                sell_oid = oid
-                if isinstance(cloid_raw, str) and cloid_raw:
-                    sell_cloid = Cloid(cloid_raw)
+                order_price = self._safe_decimal(order.get("limitPx") or order.get("px"))
+                classification = None
+                if self.stop_oid is not None and oid == self.stop_oid:
+                    classification = "stop"
+                elif self.sell_oid is not None and oid == self.sell_oid:
+                    classification = "take"
+                elif (
+                    isinstance(cloid_raw, str)
+                    and cloid_raw
+                    and self.stop_cloid is not None
+                    and cloid_raw.lower() == self.stop_cloid.to_raw().lower()
+                ):
+                    classification = "stop"
+                elif (
+                    isinstance(cloid_raw, str)
+                    and cloid_raw
+                    and self.sell_cloid is not None
+                    and cloid_raw.lower() == self.sell_cloid.to_raw().lower()
+                ):
+                    classification = "take"
+                elif avg_price is not None and order_price is not None:
+                    classification = "stop" if order_price < avg_price else "take"
+                elif take_profit_oid is None:
+                    classification = "take"
+                else:
+                    classification = "stop"
+
+                if classification == "stop":
+                    stop_oid = oid
+                    if isinstance(cloid_raw, str) and cloid_raw:
+                        stop_cloid = Cloid(cloid_raw)
+                else:
+                    take_profit_oid = oid
+                    if isinstance(cloid_raw, str) and cloid_raw:
+                        take_profit_cloid = Cloid(cloid_raw)
         self.buy_oid = buy_oid
-        self.sell_oid = sell_oid
+        self.sell_oid = take_profit_oid
+        self.stop_oid = stop_oid
         if buy_cloid is not None:
             self.buy_cloid = buy_cloid
-        if sell_cloid is not None:
-            self.sell_cloid = sell_cloid
+        if take_profit_cloid is not None:
+            self.sell_cloid = take_profit_cloid
+        if stop_cloid is not None:
+            self.stop_cloid = stop_cloid
         if buy_oid is None and buy_cloid is None:
             self._clear_buy_refs()
-        if sell_oid is None and sell_cloid is None:
-            self._clear_sell_refs()
+        if take_profit_oid is None and take_profit_cloid is None:
+            self._clear_take_profit_refs()
+        if stop_oid is None and stop_cloid is None:
+            self._clear_stop_refs()
         return orders
 
     async def _fetch_open_orders(self) -> list[dict[str, Any]]:
@@ -545,9 +917,26 @@ class HyperliquidGridBot:
             await asyncio.sleep(delay)
         LOGGER.warning("Orders still active for sides %s after %s attempts", sides, attempts)
 
-    async def _has_active_sell_order(self) -> bool:
+    async def _has_active_take_profit_order(self) -> bool:
         orders = await self._fetch_open_orders()
-        return bool(self._orders_by_side(orders, {"A"}))
+        avg_price = None
+        if self.position_qty > 0:
+            try:
+                avg_price = self.position_cost / self.position_qty
+            except (InvalidOperation, DivisionByZero):
+                avg_price = None
+        for order in orders:
+            side = str(order.get("side") or "").upper()
+            if side != "A":
+                continue
+            order_price = self._safe_decimal(order.get("limitPx") or order.get("px"))
+            if self.sell_cloid is not None:
+                cloid_raw = order.get("cloid")
+                if isinstance(cloid_raw, str) and cloid_raw.lower() == self.sell_cloid.to_raw().lower():
+                    return True
+            if avg_price is not None and order_price is not None and order_price >= avg_price:
+                return True
+        return False
 
     async def _ensure_market_metadata(self) -> None:
         if self._market_meta_loaded:
@@ -637,6 +1026,149 @@ class HyperliquidGridBot:
         self._recent_buy_fill_times.append(now)
         delay = self.BUY_COOLDOWN_STEP_SECONDS * len(self._recent_buy_fill_times)
         return delay
+
+    def _recompute_stop_loss_price(self) -> None:
+        pct = self.cfg.stop_loss_pct
+        if pct is None:
+            self.stop_loss_price = None
+            return
+        if pct <= 0 or self.position_qty <= 0:
+            self.stop_loss_price = None
+            return
+        margin = self.margin_used
+        if (
+            (margin is None or margin <= 0)
+            and self.current_leverage is not None
+            and self.current_leverage > 0
+        ):
+            try:
+                margin = self.position_cost / self.current_leverage
+            except (InvalidOperation, DivisionByZero):
+                margin = None
+        if margin is None or margin <= 0:
+            self.stop_loss_price = None
+            return
+        try:
+            avg_price = self.position_cost / self.position_qty
+        except (InvalidOperation, DivisionByZero):
+            self.stop_loss_price = None
+            return
+        if avg_price <= 0:
+            self.stop_loss_price = None
+            return
+        target_pnl = (Decimal("0") - pct) * margin
+        try:
+            stop_price = avg_price + (target_pnl / self.position_qty)
+        except (InvalidOperation, DivisionByZero):
+            self.stop_loss_price = None
+            return
+        if stop_price <= 0:
+            self.stop_loss_price = None
+            return
+        quantized_price = self._quantize_price(stop_price, is_buy=True)
+        if quantized_price <= 0:
+            self.stop_loss_price = None
+            return
+        previous = self.stop_loss_price
+        self.stop_loss_price = quantized_price
+        if previous != quantized_price:
+            LOGGER.info(
+                "Calculated stop loss price=%s (target ROE=-%s) avg_price=%s margin=%s leverage=%s",
+                quantized_price,
+                pct,
+                avg_price,
+                margin,
+                self.current_leverage,
+            )
+
+    def _update_position_metrics_from_snapshot(self, snapshot: PositionSnapshot) -> None:
+        qty = snapshot.qty
+        avg_px = snapshot.avg_px
+
+        computed_avg_px: Optional[Decimal] = None
+        if qty is not None and qty > 0:
+            if avg_px is not None and avg_px > 0:
+                computed_avg_px = avg_px
+            else:
+                # Derive average entry price from position value and pnl when available
+                entry_notional: Optional[Decimal] = None
+                if (
+                    snapshot.position_value is not None
+                    and snapshot.unrealized_pnl is not None
+                ):
+                    try:
+                        entry_notional = snapshot.position_value - snapshot.unrealized_pnl
+                    except InvalidOperation:
+                        entry_notional = None
+                if entry_notional is None and snapshot.position_value is not None:
+                    entry_notional = snapshot.position_value
+                if entry_notional is not None:
+                    try:
+                        computed_avg_px = entry_notional / qty
+                    except (InvalidOperation, DivisionByZero):
+                        computed_avg_px = None
+
+        if (
+            qty is not None
+            and qty > 0
+            and computed_avg_px is not None
+            and computed_avg_px > 0
+        ):
+            self.last_buy_fill_price = computed_avg_px
+            self.position_cost = qty * computed_avg_px
+
+        margin_estimate: Optional[Decimal] = None
+        if snapshot.margin_used is not None and snapshot.margin_used > 0:
+            margin_estimate = snapshot.margin_used
+        elif (
+            snapshot.position_value is not None
+            and snapshot.leverage is not None
+            and snapshot.leverage > 0
+        ):
+            try:
+                margin_estimate = snapshot.position_value / snapshot.leverage
+            except (InvalidOperation, DivisionByZero):
+                margin_estimate = None
+        elif (
+            snapshot.return_on_equity is not None
+            and snapshot.return_on_equity != 0
+            and snapshot.unrealized_pnl is not None
+        ):
+            try:
+                margin_estimate = snapshot.unrealized_pnl / snapshot.return_on_equity
+            except (InvalidOperation, DivisionByZero):
+                margin_estimate = None
+        if margin_estimate is not None and margin_estimate < 0:
+            margin_estimate = margin_estimate.copy_abs()
+        self.margin_used = margin_estimate
+
+        leverage_estimate: Optional[Decimal] = None
+        if snapshot.leverage is not None and snapshot.leverage > 0:
+            leverage_estimate = snapshot.leverage
+        elif (
+            snapshot.position_value is not None
+            and margin_estimate is not None
+            and margin_estimate > 0
+        ):
+            try:
+                leverage_estimate = snapshot.position_value / margin_estimate
+            except (InvalidOperation, DivisionByZero):
+                leverage_estimate = None
+        self.current_leverage = leverage_estimate
+
+        roe_estimate = snapshot.return_on_equity
+        if (
+            roe_estimate is None
+            and snapshot.unrealized_pnl is not None
+            and margin_estimate is not None
+            and margin_estimate != 0
+        ):
+            try:
+                roe_estimate = snapshot.unrealized_pnl / margin_estimate
+            except (InvalidOperation, DivisionByZero):
+                roe_estimate = None
+        self.current_return_on_equity = roe_estimate
+        self._recompute_stop_loss_price()
 
     def _cancel_pending_buy_task(self) -> None:
         task = self._pending_buy_task
@@ -751,10 +1283,19 @@ class HyperliquidGridBot:
         self.buy_oid = None
         self.buy_order_ts = None
 
-    def _clear_sell_refs(self) -> None:
+    def _clear_take_profit_refs(self) -> None:
         self.sell_cloid = None
         self.sell_oid = None
         self.sell_order_ts = None
+
+    def _clear_stop_refs(self) -> None:
+        self.stop_cloid = None
+        self.stop_oid = None
+        self.stop_order_ts = None
+
+    def _clear_sell_refs(self) -> None:
+        self._clear_take_profit_refs()
+        self._clear_stop_refs()
 
     async def _restore_remote_state(self) -> None:
         await self._load_remote_position()
@@ -769,6 +1310,10 @@ class HyperliquidGridBot:
         self.position_qty = Decimal("0")
         self.position_cost = Decimal("0")
         self.last_buy_fill_price = None
+        self.margin_used = None
+        self.current_leverage = None
+        self.current_return_on_equity = None
+        self.stop_loss_price = None
 
         if not self.market_coin:
             return
@@ -783,17 +1328,40 @@ class HyperliquidGridBot:
             LOGGER.warning("Failed to fetch remote position state: %s", exc)
             return
 
-        qty, avg_px = self._extract_remote_position(state)
-        if qty is None or qty == Decimal("0"):
+        snapshot = self._extract_remote_position(state)
+        if snapshot is None or snapshot.qty is None or snapshot.qty == Decimal("0"):
             return
-        self.position_qty = qty
-        if avg_px is not None and avg_px > 0:
-            self.last_buy_fill_price = avg_px
-            self.position_cost = qty * avg_px
+        self.position_qty = snapshot.qty
+        self._update_position_metrics_from_snapshot(snapshot)
 
-    def _extract_remote_position(self, state: Any) -> tuple[Optional[Decimal], Optional[Decimal]]:
+    async def _refresh_stop_loss_state(self) -> None:
+        if self.cfg.stop_loss_pct is None:
+            return
+        if not self.market_coin:
+            return
+        user_state_fn = getattr(self.info, "user_state", None)
+        if user_state_fn is None:
+            return
+        try:
+            state = await asyncio.to_thread(user_state_fn, self.address)
+        except Exception as exc:
+            LOGGER.debug("Unable to refresh stop loss state: %s", exc)
+            return
+        snapshot = self._extract_remote_position(state)
+        if snapshot is None or snapshot.qty is None or snapshot.qty <= 0:
+            self.margin_used = None
+            self.current_leverage = None
+            self.current_return_on_equity = snapshot.return_on_equity if snapshot else None
+            self.stop_loss_price = None
+            await self._cancel_stop_loss_order()
+            return
+        self.position_qty = snapshot.qty
+        self._update_position_metrics_from_snapshot(snapshot)
+        await self._place_stop_loss_order()
+
+    def _extract_remote_position(self, state: Any) -> Optional[PositionSnapshot]:
         if not state:
-            return None, None
+            return None
         target = _canonical_symbol(self.market)
         stack: list[Any] = [state]
         while stack:
@@ -817,35 +1385,69 @@ class HyperliquidGridBot:
             if _canonical_symbol(str(coin_raw)) != target:
                 continue
 
-            # Try different field names for size: 'szi', 'sz', 'size'
-            qty = self._safe_decimal(
-                candidate.get("szi") or candidate.get("sz") or candidate.get("size")
-            )
-            if qty is None and isinstance(candidate.get("position"), dict):
-                nested = candidate["position"]
-                qty = self._safe_decimal(
-                    nested.get("szi") or nested.get("sz") or nested.get("size")
-                )
+            sources: list[dict[str, Any]] = [candidate]
+            nested_position = candidate.get("position")
+            if isinstance(nested_position, dict):
+                sources.append(nested_position)
 
-            # Try different field names for price: 'entryPx', 'px', 'avgEntryPrice'
-            avg_px = self._safe_decimal(
-                candidate.get("entryPx") or candidate.get("px") or candidate.get("avgEntryPrice")
-            )
-            if avg_px is None and isinstance(candidate.get("position"), dict):
-                nested = candidate["position"]
-                avg_px = self._safe_decimal(
-                    nested.get("entryPx") or nested.get("px") or nested.get("avgEntryPrice")
-                )
+            def _first_decimal(keys: Sequence[str]) -> Optional[Decimal]:
+                for source in sources:
+                    for key in keys:
+                        if key not in source:
+                            continue
+                        result = self._safe_decimal(source.get(key))
+                        if result is not None:
+                            return result
+                return None
 
-            if qty is not None:
-                LOGGER.info(
-                    "Loaded remote position for %s: qty=%s avg_px=%s",
-                    coin_raw,
-                    qty,
-                    avg_px
-                )
-                return qty, avg_px
-        return None, None
+            qty = _first_decimal(("szi", "sz", "size"))
+            avg_px = _first_decimal(("entryPx", "px", "avgEntryPrice"))
+            margin_used = _first_decimal(("marginUsed",))
+            position_value = _first_decimal(("positionValue", "positionNotional", "notional"))
+            return_on_equity = _first_decimal(("returnOnEquity",))
+            unrealized_pnl = _first_decimal(("unrealizedPnl", "unrealizedPNL", "unrealizedPnlUsd"))
+
+            leverage_value: Optional[Decimal] = None
+            for source in sources:
+                leverage_raw = source.get("leverage")
+                if isinstance(leverage_raw, dict):
+                    leverage_value = self._safe_decimal(leverage_raw.get("value"))
+                else:
+                    leverage_value = self._safe_decimal(leverage_raw)
+                if leverage_value is not None:
+                    break
+            if (
+                leverage_value is None
+                and position_value is not None
+                and margin_used is not None
+                and margin_used != 0
+            ):
+                try:
+                    leverage_value = position_value / margin_used
+                except (InvalidOperation, DivisionByZero):
+                    leverage_value = None
+
+            snapshot = PositionSnapshot(
+                qty=qty,
+                avg_px=avg_px,
+                margin_used=margin_used,
+                position_value=position_value,
+                leverage=leverage_value,
+                return_on_equity=return_on_equity,
+                unrealized_pnl=unrealized_pnl,
+            )
+            LOGGER.info(
+                "Loaded remote position for %s: qty=%s avg_px=%s margin=%s leverage=%s return_on_equity=%s unrealized_pnl=%s",
+                coin_raw,
+                qty,
+                avg_px,
+                margin_used,
+                leverage_value,
+                return_on_equity,
+                unrealized_pnl,
+            )
+            return snapshot
+        return None
 
     def _infer_level_from_state(self) -> None:
         if self.position_qty != Decimal("0"):
@@ -968,6 +1570,17 @@ async def main() -> None:
     profit_pct = Decimal(os.environ.get("HYPERLIQUID_PROFIT_PCT", "0.0002"))
     size_ratio = Decimal(os.environ.get("HYPERLIQUID_SIZE_RATIO", "2"))
     order_timeout = float(os.environ.get("HYPERLIQUID_ORDER_TIMEOUT_SECONDS", "10"))
+    stop_loss_pct_env = os.environ.get("HYPERLIQUID_STOP_LOSS_PCT")
+    stop_loss_pct: Optional[Decimal] = None
+    if stop_loss_pct_env:
+        stop_loss_pct_candidate = Decimal(stop_loss_pct_env)
+        if stop_loss_pct_candidate <= 0:
+            raise ValueError("HYPERLIQUID_STOP_LOSS_PCT must be positive when provided.")
+        stop_loss_pct = stop_loss_pct_candidate
+
+    stop_loss_cooldown_minutes = float(os.environ.get("HYPERLIQUID_STOP_LOSS_COOLDOWN_MINUTES", "5"))
+    if stop_loss_cooldown_minutes < 0:
+        raise ValueError("HYPERLIQUID_STOP_LOSS_COOLDOWN_MINUTES must be non-negative.")
 
     exchange = Exchange(
         wallet=wallet,
@@ -986,6 +1599,8 @@ async def main() -> None:
         profit_pct=profit_pct,
         size_ratio=size_ratio,
         order_timeout_seconds=order_timeout,
+        stop_loss_pct=stop_loss_pct,
+        stop_loss_cooldown_minutes=stop_loss_cooldown_minutes,
     )
 
     bot = HyperliquidGridBot(exchange, info, account_address, cfg)
