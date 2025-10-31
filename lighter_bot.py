@@ -434,14 +434,13 @@ class LighterGridBot:
         size_int = self._encode_size(quantity, round_up=False)
         client_index = self._generate_client_index(prefix=1)
 
-        tx, resp, err = await self._submit_limit_order_with_retry(
+        tx, resp, err = await self._safe_place_order(
             market_index=self.market_id,
             client_index=client_index,
             base_amount=size_int,
             price=price_int,
             is_ask=False,
             time_in_force=self.signer.ORDER_TIME_IN_FORCE_POST_ONLY,
-            retries=1,
         )
         if err:
             raise RuntimeError(f"Buy order submission failed: {err}")
@@ -481,7 +480,7 @@ class LighterGridBot:
         size_int = self._encode_size(quantity, round_up=True)
         client_index = self._generate_client_index(prefix=2)
 
-        tx, resp, err = await self._submit_limit_order_with_retry(
+        tx, resp, err = await self._safe_place_order(
             market_index=self.market_id,
             client_index=client_index,
             base_amount=size_int,
@@ -489,7 +488,6 @@ class LighterGridBot:
             is_ask=True,
             time_in_force=self.signer.ORDER_TIME_IN_FORCE_POST_ONLY,
             reduce_only=True,
-            retries=1,
         )
         if err:
             LOGGER.warning("Failed to submit take-profit order: %s", err)
@@ -647,7 +645,7 @@ class LighterGridBot:
             task.cancel()
         self._pending_buy_task = None
 
-    async def _submit_limit_order_with_retry(
+    async def _safe_place_order(
         self,
         *,
         market_index: int,
@@ -657,12 +655,22 @@ class LighterGridBot:
         is_ask: bool,
         time_in_force: int,
         reduce_only: bool = False,
-        retries: int = 1,
-        retry_delay: float = 0.2,
+        max_attempts: int = 4,
+        base_delay: float = 0.25,
     ):
-        attempt = 0
-        while True:
-            tx, resp, err = await self.signer.create_order(
+        """
+        Submit an order while handling invalid nonce responses from the signer.
+        Mirrors _safe_cancel behaviour with retries and optional nonce refresh.
+        """
+        attempt = 3
+        delay = max(base_delay, 0.2)
+        last_tx = None
+        last_resp = None
+        last_err = None
+        nonce_manager = getattr(self.signer, "nonce_manager", None)
+
+        while attempt <= max_attempts:
+            last_tx, last_resp, last_err = await self.signer.create_order(
                 market_index=market_index,
                 client_order_index=client_index,
                 base_amount=base_amount,
@@ -672,14 +680,37 @@ class LighterGridBot:
                 time_in_force=time_in_force,
                 reduce_only=reduce_only,
             )
-            if err:
-                err_lower = str(err).lower()
-                if "invalid nonce" in err_lower and attempt < retries:
-                    attempt += 1
-                    LOGGER.warning("create_order returned invalid nonce; retrying (attempt %s)", attempt + 1)
-                    await asyncio.sleep(retry_delay)
-                    continue
-            return tx, resp, err
+            if not last_err:
+                return last_tx, last_resp, None
+
+            err_text = str(last_err).lower()
+            if "invalid nonce" not in err_text or attempt == max_attempts:
+                return last_tx, last_resp, last_err
+
+            refreshed = False
+            api_key_index = getattr(nonce_manager, "current_api_key", None)
+            if nonce_manager and hasattr(nonce_manager, "hard_refresh_nonce") and api_key_index is not None:
+                try:
+                    nonce_manager.hard_refresh_nonce(api_key_index)
+                    refreshed = True
+                except Exception as refresh_err:  # pragma: no cover - defensive
+                    LOGGER.warning(
+                        "Failed to hard refresh nonce for api key %s: %s",
+                        api_key_index,
+                        refresh_err,
+                    )
+
+            LOGGER.warning(
+                "create_order returned invalid nonce; %sretrying (attempt %s/%s)",
+                "refreshed nonce and " if refreshed else "",
+                attempt + 1,
+                max_attempts,
+            )
+            attempt += 1
+            await asyncio.sleep(delay)
+            delay = max(delay * 1.5, base_delay)
+
+        return last_tx, last_resp, last_err
 
     async def _delayed_place_buy(self, level: int, delay: float) -> None:
         current_task = asyncio.current_task()
