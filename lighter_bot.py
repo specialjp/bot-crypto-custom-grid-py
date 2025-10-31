@@ -606,14 +606,32 @@ class LighterGridBot:
         market = market_id if market_id is not None else self.market_id
         if market is None or order_index is None:
             return
-        try:
-            _, resp, err = await self.signer.cancel_order(market, order_index)
+        max_attempts = 3
+        delay = 0.2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                _, resp, err = await self.signer.cancel_order(market, order_index)
+            except Exception as exc:  # pragma: no cover - networking
+                LOGGER.warning("Cancel order exception for %s: %s", order_index, exc)
+                return
+
             if err:
+                err_lower = str(err).lower()
+                if "invalid nonce" in err_lower and attempt < max_attempts:
+                    LOGGER.warning(
+                        "Cancel order %s returned invalid nonce; retrying (attempt %s/%s)",
+                        order_index,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 LOGGER.warning("Failed to cancel order %s: %s", order_index, err)
-            elif resp and resp.message:
+                return
+
+            if resp and resp.message:
                 LOGGER.info("Cancel order response: %s", resp.message)
-        except Exception as exc:  # pragma: no cover - networking
-            LOGGER.warning("Cancel order exception for %s: %s", order_index, exc)
+            return
 
     def _register_buy_cooldown_delay(self) -> float:
         now = time.time()
@@ -896,7 +914,7 @@ async def main() -> None:
     price_offset_multiplier = Decimal(os.environ.get("LIGHTER_PRICE_OFFSET_MULTIPLIER", "1"))
     profit_pct = Decimal(os.environ.get("LIGHTER_PROFIT_PCT", "0.0002"))
     size_ratio = Decimal(os.environ.get("LIGHTER_SIZE_RATIO", "1"))
-    order_timeout = float(os.environ.get("LIGHTER_ORDER_TIMEOUT_SECONDS", "10"))
+    order_timeout = float(os.environ.get("LIGHTER_ORDER_TIMEOUT_SECONDS", "45"))
 
     configuration = Configuration(host=base_url)
     api_client = ApiClient(configuration=configuration)
